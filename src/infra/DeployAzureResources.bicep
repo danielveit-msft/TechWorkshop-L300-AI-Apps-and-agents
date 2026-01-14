@@ -114,6 +114,7 @@ resource aiFoundry 'Microsoft.CognitiveServices/accounts@2025-04-01-preview' = {
     customSubDomainName: aiFoundryName
 
     disableLocalAuth: false
+    restore: true
     publicNetworkAccess: 'Enabled'
   }
 }
