@@ -7,6 +7,11 @@ RUN apt-get update && apt-get upgrade -y && pip install --upgrade pip && rm -rf 
 # Set work directory
 WORKDIR /app
 
+COPY . .
+
+RUN --mount=type=secret,id=envfile,target=/run/secrets/envfile \
+    cp /run/secrets/envfile .env
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential unixodbc-dev gcc g++ \
