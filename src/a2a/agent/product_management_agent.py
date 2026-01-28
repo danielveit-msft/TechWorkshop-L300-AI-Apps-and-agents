@@ -9,7 +9,7 @@ import openai
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from agent_framework import AgentThread, TextContent, ChatAgent, BaseChatClient, ai_function
+from agent_framework import AgentThread, ChatAgent, BaseChatClient, ai_function
 from agent_framework.openai import OpenAIChatClient
 from agent_framework.azure import AzureOpenAIChatClient
 
@@ -112,6 +112,54 @@ def _get_openai_chat_completion_service() -> OpenAIChatClient:
 
 # endregion
 
+# region Get Products
+
+@ai_function(
+    name='get_products',
+    description='Retrieves a set of products based on a natural language user query.'
+)
+def get_products(
+    self,
+    question: Annotated[
+        str, 'Natural language query to retrieve products, e.g. "What kinds of paint rollers do you have in stock?"'
+    ],
+) -> list[dict[str, Any]]:
+    try:
+        # Simulate product retrieval based on the question
+        # In a real implementation, this would query a database or external service
+        product_dict = [
+            {
+                "id": "1",
+                "name": "Eco-Friendly Paint Roller",
+                "type": "Paint Roller",
+                "description": "A high-quality, eco-friendly paint roller for smooth finishes.",
+                "punchLine": "Roll with the best, paint with the rest!",
+                "price": 15.99
+            },
+            {
+                "id": "2",
+                "name": "Premium Paint Brush Set",
+                "type": "Paint Brush",
+                "description": "A set of premium paint brushes for detailed work and fine finishes.",
+                "punchLine": "Brush up your skills with our premium set!",
+                "price": 25.49
+            },
+            {
+                "id": "3",
+                "name": "All-Purpose Paint Tray",
+                "type": "Paint Tray",
+                "description": "A durable paint tray suitable for all types of rollers and brushes.",
+                "punchLine": "Tray it, paint it, love it!",
+                "price": 9.99
+            }
+        ]
+        return product_dict
+    except Exception as e:
+        return f'Product recommendation failed: {e!s}'
+
+
+# endregion
+
 # region Response Format
 
 
@@ -138,16 +186,60 @@ class AgentFrameworkProductManagementAgent:
         # Configure the chat completion service explicitly
         chat_service = get_chat_completion_service(ChatServices.AZURE_OPENAI)
 
+        # Define an MarketingAgent to handle marketing-related tasks
+        marketing_agent = ChatAgent(
+            chat_client=chat_service,
+            name='MarketingAgent',
+            instructions=(
+                'You specialize in planning and recommending marketing strategies for products. '
+                'This includes identifying target audiences, making product descriptions better, and suggesting promotional tactics. '
+                'Your goal is to help businesses effectively market their products and reach their desired customers.'
+            ),
+        )
+
+        # Define an RankerAgent to sort and recommend results
+        ranker_agent = ChatAgent(
+            chat_client=chat_service,
+            name='RankerAgent',
+            instructions=(
+                'You specialize in ranking and recommending products based on various criteria. '
+                'This includes analyzing product features, customer reviews, and market trends to provide tailored suggestions. '
+                'Your goal is to help customers find the best products for their needs.'
+            ),
+        )
+
+        # Define a ProductAgent to retrieve products from the Zava catalog
+        product_agent = ChatAgent(
+            chat_client=chat_service,
+            name='ProductAgent',
+            instructions=("""
+                You specialize in handling product-related requests from customers and employees.
+                This includes providing a list of products, identifying available quantities,
+                providing product prices, and giving product descriptions as they exist in the product catalog.
+                Your goal is to assist customers promptly and accurately with all product-related inquiries.
+                You are a helpful assistant that MUST use the get_products tool to answer all the questions from user.
+                You MUST NEVER answer from your own knowledge UNDER ANY CIRCUMSTANCES.
+                You MUST only use products from the get_products tool to answer product-related questions.
+                Do not ask the user for more information about the products; instead use the get_products tool to find the
+                relevant products and provide the information based on that.
+                Do not make up any product information. Use only the product information from the get_products tool.
+                """
+            ),
+            tools=get_products,
+        )
+
         # Define the main ProductManagerAgent to delegate tasks to the appropriate agents
         self.agent = ChatAgent(
             chat_client=chat_service,
             name='ProductManagerAgent',
             instructions=(
                 "Your role is to carefully analyze the user's request and respond as best as you can. "
-                'Your primary goal is precise and efficient delegation to ensure customers and employees receive accurate and specialized '
-                'assistance promptly.'
+                'Your primary goal is precise and efficient delegation to ensure customers and employees receive accurate and specialized assistance promptly.'
+                'Whenever a user query is related to retrieving product information, you MUST delegate the task to the ProductAgent.'
+                'Use the MarketingAgent for marketing-related queries and the RankerAgent for product ranking and recommendation tasks.'
+                'You may use these agents in conjunction with each other to provide comprehensive responses to user queries.'
             ),
-            tools=[],
+            tools=[product_agent.as_tool(), marketing_agent.as_tool(), ranker_agent.as_tool()],
         )
 
     async def invoke(self, user_input: str, session_id: str) -> dict[str, Any]:
@@ -163,13 +255,22 @@ class AgentFrameworkProductManagementAgent:
         """
         await self._ensure_thread_exists(session_id)
 
-        # Use Agent Framework's run for a single shot
-        response = await self.agent.run(
-            messages=user_input,
-            thread=self.thread,
-            response_format=ResponseFormat,
-        )
-        return self._get_agent_response(response.text)
+        try:
+            # Use Agent Framework's run for a single shot
+            response = await self.agent.run(
+                messages=user_input,
+                thread=self.thread,
+                response_format=ResponseFormat,
+            )
+            logger.debug(f"Agent response: {response}")
+            return self._get_agent_response(response.text)
+        except Exception as e:
+            logger.error(f"Error in agent invoke: {e}", exc_info=True)
+            return {
+                'is_task_complete': False,
+                'require_user_input': True,
+                'content': f'An error occurred: {str(e)}',
+            }
 
     async def stream(
         self,
@@ -189,7 +290,7 @@ class AgentFrameworkProductManagementAgent:
         await self._ensure_thread_exists(session_id)
 
         # text_notice_seen = False
-        chunks: list[TextContent] = []
+        chunks: list[str] = []
 
         async for chunk in self.agent.run_stream(
             messages=user_input,
@@ -202,47 +303,51 @@ class AgentFrameworkProductManagementAgent:
             yield self._get_agent_response(sum(chunks[1:], chunks[0]))
 
     def _get_agent_response(
-        self, message: TextContent
+        self, message: str
     ) -> dict[str, Any]:
         """Extracts the structured response from the agent's message content.
 
         Args:
-            message (TextContent): The message content from the agent.
+            message (str): The message content from the agent.
 
         Returns:
             dict: A dictionary containing the content, task completion status, and user input requirement.
         """
-        structured_response = ResponseFormat.model_validate_json(
-            message
-        )
-
         default_response = {
             'is_task_complete': False,
             'require_user_input': True,
             'content': 'We are unable to process your request at the moment. Please try again.',
         }
 
-        if isinstance(structured_response, ResponseFormat):
-            response_map = {
-                'input_required': {
-                    'is_task_complete': False,
-                    'require_user_input': True,
-                },
-                'error': {
-                    'is_task_complete': False,
-                    'require_user_input': True,
-                },
-                'completed': {
-                    'is_task_complete': True,
-                    'require_user_input': False,
-                },
-            }
+        try:
+            structured_response = ResponseFormat.model_validate_json(
+                message
+            )
 
-            response = response_map.get(structured_response.status)
-            if response:
-                return {**response, 'content': structured_response.message}
+            if isinstance(structured_response, ResponseFormat):
+                response_map = {
+                    'input_required': {
+                        'is_task_complete': False,
+                        'require_user_input': True,
+                    },
+                    'error': {
+                        'is_task_complete': False,
+                        'require_user_input': True,
+                    },
+                    'completed': {
+                        'is_task_complete': True,
+                        'require_user_input': False,
+                    },
+                }
 
-        return default_response
+                response = response_map.get(structured_response.status)
+                if response:
+                    return {**response, 'content': structured_response.message}
+
+            return default_response
+        except Exception as e:
+            logger.error(f"Error parsing agent response: {e}, message: {message}")
+            return {**default_response, 'content': str(message) if message else default_response['content']}
 
     async def _ensure_thread_exists(self, session_id: str) -> None:
         """Ensure the thread exists for the given session ID.
